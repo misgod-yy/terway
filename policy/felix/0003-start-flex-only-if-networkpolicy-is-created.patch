@@ -1,0 +1,124 @@
+From 1ce6b5b2e065a7c67250c831082631d75d0e8892 Mon Sep 17 00:00:00 2001
+From: "libokang.lbk" <libokang.lbk@alibaba-inc.com>
+Date: Tue, 2 Aug 2022 20:10:45 +0800
+Subject: [PATCH] start flex only if networkpolicy is created
+
+---
+ daemon/daemon.go | 90 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 90 insertions(+)
+
+diff --git a/daemon/daemon.go b/daemon/daemon.go
+index 65fa6a3b1..c7679a9de 100644
+--- a/daemon/daemon.go
++++ b/daemon/daemon.go
+@@ -24,6 +24,7 @@ import (
+ 	"os/signal"
+ 	"runtime"
+ 	"runtime/debug"
++	"strings"
+ 	"sync"
+ 	"syscall"
+ 	"time"
+@@ -372,6 +373,77 @@ configRetry:
+ 		simulateDataRace()
+ 	}
+
++	// wait networkpolicy actually created and start the actual cache sync
++	if os.Getenv("DISABLE_POLICY") == "auto" {
++		out, err := exec.Command("iptables-save").CombinedOutput()
++		if err != nil {
++			panic(err)
++		}
++		if !strings.Contains(string(out), "cali-") {
++			// wait networkpolicy created
++			log.Infof("Waitting the datastore Syncer")
++
++			additionalTypes := []watchersyncer.ResourceType{
++				{
++					ListInterface: model.ResourceListOptions{Kind: apiv3.KindGlobalNetworkPolicy},
++				}, {
++					ListInterface: model.ResourceListOptions{Kind: model.KindKubernetesNetworkPolicy},
++				},
++			}
++
++			vv := NewEventHandler()
++			syncer2 := watchersyncer.New(backendClient, additionalTypes, vv)
++			syncer2.Start()
++			tick := time.NewTicker(10 * time.Minute)
++			rework := make(chan struct{}, 1)
++			for {
++				select {
++				case <-vv.Change:
++					log.Info("get obj update")
++				case <-rework:
++				case <-tick.C:
++				}
++				objs, err := backendClient.List(context.Background(), model.ResourceListOptions{Kind: model.KindKubernetesNetworkPolicy}, "0")
++				if err != nil {
++					log.Error(err)
++					time.Sleep(5 * time.Second)
++					select {
++					case rework <- struct{}{}:
++					default:
++					}
++					continue
++				}
++				if len(objs.KVPairs) > 0 {
++					log.Info("get kube networkPolicy")
++					break
++				}
++
++				objs, err = backendClient.List(context.Background(), model.ResourceListOptions{Kind: apiv3.KindGlobalNetworkPolicy}, "0")
++				if err != nil {
++					log.Error(err)
++					time.Sleep(5 * time.Second)
++					select {
++					case rework <- struct{}{}:
++					default:
++					}
++					continue
++				}
++				if len(objs.KVPairs) > 0 {
++					log.Info("get global networkPolicy")
++					break
++				}
++			}
++			log.Infof("Try stop syncer the datastore Syncer")
++			tick.Stop()
++
++			go func() {
++				for _ = range vv.Change {
++				}
++			}()
++			syncer2.Stop()
++		}
++	}
++
+ 	// Start up the dataplane driver.  This may be the internal go-based driver or an external
+ 	// one.
+ 	var dpDriver dp.DataplaneDriver
+@@ -1201,3 +1273,21 @@ func discoverTyphaAddr(configParams *config.Config, k8sClientSet kubernetes.Inte
+ 	typhaDiscoveryOpts = append(typhaDiscoveryOpts, discovery.WithKubeClient(k8sClientSet))
+ 	return discovery.DiscoverTyphaAddr(typhaDiscoveryOpts...)
+ }
++
++func NewEventHandler() *WatchEventHandler {
++	return &WatchEventHandler{
++		Change: make(chan struct{}, 10),
++	}
++}
++
++type WatchEventHandler struct {
++	Change chan struct{}
++}
++
++func (v *WatchEventHandler) OnStatusUpdated(status bapi.SyncStatus) {
++	v.Change <- struct{}{}
++}
++
++func (v *WatchEventHandler) OnUpdates(updates []bapi.Update) {
++	v.Change <- struct{}{}
++}
+-- 
+2.36.1
+
